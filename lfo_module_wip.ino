@@ -1,11 +1,146 @@
 #include <math.h>
 
 enum LFOMode {
-  SIN,
-  TRI,
-  SQUARE,
-  SAW,
-  RAND,
+  mode_sine,
+  mode_triangle,
+  mode_square,
+  mode_saw
+};
+
+// Global configuration
+const float g_sampleRate = 100;
+const int g_ppq = 24; // Minibrute 2S default setting
+
+// Global variables
+const int clockPin = 2; // Interrupt PIN for clock sync
+volatile unsigned long g_last_time = 0;
+volatile float g_bpm = 120.0f;
+typedef float (*WaveformFunc)(float phase);
+
+class LFO {
+  public:
+    // Class variables
+    int outPin;                // Output pin for the waveform
+    int ratePin;               // Analog input pin to control frequency rate
+    int offsetPin;             // Analog input pin to control offset
+    int ledPin;                // Pin for an LED indicator
+    int resetPin;              // Pin for CV reset signal
+    float minFreq;             // Minimum frequency (Hz)
+    float maxFreq;             // Maximum frequency (Hz)
+    float exponentialQ;        // Curve shaping factor for exponential response
+    volatile float phase = 0;  // Current phase of the LFO (volatile because it may update in interrupts)
+    int clockCounter = 0;      // Counts external clock ticks
+
+    // Constructor with initializer list
+    LFO(int o, int r, int off, int l, int rst, float minF, float maxF, float q)
+      : outPin(o), ratePin(r), offsetPin(off), ledPin(l), resetPin(rst),
+        minFreq(minF), maxFreq(maxF),
+        exponentialQ(q) {}
+
+    void update() {
+      this->outputValue();
+      this->updatePhase();
+    }
+
+    // Methods to return values based on digital pin states and switches
+    bool getIsSynced() {
+      return false;
+      // TODO - add sync switch variables and implement; Based on on/off switch
+    }
+
+    WaveformFunc getLfoModeFunction() {
+      // TODO - implement, based on 4-way switch;
+      return sineValue;
+    }
+
+    float getOffsetCv() {
+      return 0.0;
+      // TODO - Map -1 to +1 based on voltage on the offsetPin
+    }
+
+    float getNoteDivision() {
+      return 2.0f / 3;
+      // TODO: implement based on rate pin
+    }
+
+    float getFreeFrequency() {
+        float potVal = 250; // Todo: read
+        float normalized = potVal / 1023.0;
+        float curved = pow(normalized, this->exponentialQ);
+
+        return this->minFreq + curved * (this->maxFreq - this->minFreq);
+    }
+
+    float getSyncedFrequency() {
+      return 1.0;
+      // TODO - Calcuate freq value based on ratePin reading and map to division length + BPM
+    }
+
+    float updatePhase() {
+      float freq = this->getIsSynced() ? this->getSyncedFrequency() : this->getFreeFrequency();
+      float increment = 2 * PI * freq / g_sampleRate;
+
+      this->phase += increment;
+
+      if (this->phase >= 2 * PI) {
+        this->phase -= 2 * PI;
+      }
+    }
+
+    void clockPulse() {
+      if (this->getIsSynced()) {
+        long cycle_length = this->getNoteDivision() * g_ppq; 
+        float pulse_phase_length = 2 * PI / cycle_length;
+        // phase = pulsePhaseLength * clockCounter;
+
+        if (this->clockCounter >= cycle_length) {
+          // phase = 0;
+          this->clockCounter = 0;
+        }
+      }
+
+      this->clockCounter++;
+    }
+
+    void outputValue() {
+      WaveformFunc lfo_function = this->getLfoModeFunction();
+      float offset_function_val = constrain(lfo_function(this->phase) + this->getOffsetCv(), -1, 1);
+
+      uint8_t pwm_value = (uint8_t)(127 + 127 * offset_function_val);
+      // analogWrite(pinOut1, pwm_value); // TODO: WRITE VALUE TO LFO OUTPUT
+
+      uint8_t led_adjusted_pwm = (uint8_t)pow(pwm_value / 255.0, 2) * 255.0; // Possible upgrade: integer math?
+      // analogWrite(ledPin1, led_adjusted_pwm); // TODO: WRITE LED ADJUSTED VALUE TO LFO OUTPUT
+
+      Serial.println(pwm_value);
+    }
+
+    void reset () {
+      this->clockCounter = 0;
+      this->phase = 0;
+    }
+
+    // Methods for calculating function values
+    static float sineValue (float phase) {
+      return sin(phase);
+    }
+
+    static float triangleValue(float phase) {
+      float norm_phase = fmod(phase, 2 * PI) / (2 * PI);
+      return 2.0 * (1.0 - fabs(2.0 * norm_phase - 1.0)) - 1.0;
+    }
+
+    static float sawValue(float phase) {
+      return (phase / (2 * PI)) * 2.0 - 1.0;
+    }
+
+    static float squareValue(float phase) {
+      if (phase > PI) {
+        return -1;
+      } else {
+        return 1;
+      }
+    }
 };
 
 int noteDivisions[] = {
@@ -28,216 +163,94 @@ int noteDivisions[] = {
   32.0f,
 };
 
-// Pin setup
-const int pinOut1 = 10; // Private
-const int pinOut2 = 11;
-const int potPin1 = A0;
-const int potPin2 = A1;
-const int clockPin = 2;
-const int resetPin = 3;
-
-const int ledPin1 = 9;
-
-// LFO configuration
-const float sampleRate = 100;
-const float minFreq = 0.02;
-const float maxFreq = 10;
-
-// Sync config
-const int ppq = 24; // Minibrute 2S default setting
-bool lfoSynced = false;
-LFOMode currentLfoMode = SQUARE;
-
-// Potentiometer config
-const float exponentialQ = 2.0f;
-
-// Init variables
-volatile float phase = 0.0f;
-volatile float phaseIncrement = 0.0f;
-
-float funcVal;
-
-float divisionLength = 1.0f;
-
-float freq, increment;
-
-int clockCounter = 0;
-int phaseResetCounter = 0;
-
-volatile unsigned long lastTime = 0;
-volatile unsigned long lastTimeClock = 0;
-volatile float bpm = 120.0f;
-
 int resetCycleLenghts[] = {
-  1 * ppq, // 0.125f,
-  1 * ppq, // 0.25f,
-  3 * ppq, // 0.25f * 1.5, = 0.375
+  1 * g_ppq, // 0.125f,
+  1 * g_ppq, // 0.25f,
+  3 * g_ppq, // 0.25f * 1.5, = 0.375
   // 0.5f / 3,
-  1 * ppq, // 0.5f,
-  3 * ppq, // 0.5f * 1.5,
+  1 * g_ppq, // 0.5f,
+  3 * g_ppq, // 0.5f * 1.5,
   // 1.0f / 3,
-  1 * ppq, // 1.0f, 
-  3 * ppq, // 1.0f * 1.5,
+  1 * g_ppq, // 1.0f, 
+  3 * g_ppq, // 1.0f * 1.5,
   // 2.0f / 3,
-  3 * ppq, // 3.0f,
+  3 * g_ppq, // 3.0f,
   // 4.0f,
   // 5.0f,
-  6 * ppq, // 6.0f,
-  8 * ppq, // 8.0f,
-  16 * ppq, // 16.0f,
-  32 * ppq,// 32.0f,
+  6 * g_ppq, // 6.0f,
+  8 * g_ppq, // 8.0f,
+  16 * g_ppq, // 16.0f,
+  32 * g_ppq,// 32.0f,
 };
 
+// INIT LFOS GLOBALLY
+LFO lfo1(
+  9,        // outPin: PWM output on digital pin 9
+  A0,       // ratePin: frequency control from analog pin A0
+  A1,       // offsetPin: offset control from analog pin A1
+  13,       // ledPin: onboard LED for blinking with LFO
+  3,        // resetPin: pin for reset interrupt
+  0.02f,     // minFreq: minimum frequency 0.02 Hz
+  10.0f,    // maxFreq: maximum frequency 10 Hz
+  2.0f     // exponentialQ: neutral curve shaping (1.0 = linear)
+);
+
 void setup() {
-  pinMode(pinOut1, OUTPUT);
-  pinMode(ledPin1, OUTPUT);
-
   pinMode(clockPin, INPUT_PULLUP);
-  pinMode(resetPin, INPUT_PULLUP);
-  // pinMode(clockPin, INPUT);
-
   attachInterrupt(digitalPinToInterrupt(clockPin), clockISR, RISING);
-  attachInterrupt(digitalPinToInterrupt(resetPin), resetISR, RISING);
 
-
-  // updatePhaseIncrement();
+  attachInterrupt(digitalPinToInterrupt(lfo1.resetPin), lfo1ResetISR, RISING);
+  // attachInterrupt(digitalPinToInterrupt(lfo2.resetPin), lfo2ResetISR, RISING);
 
   Serial.begin(9600);
 }
 
-float calculateLfoFrequency(float potVal) {
-  float normalized = potVal / 1023.0;
-  float curved = pow(normalized, exponentialQ);
+// float calculateSyncedFrequency(float potVal) {
+//   // freq = minFreq + potVal * (maxFreq - minFreq);
 
-  return minFreq + curved * (maxFreq - minFreq);
-}
+//   divisionLength =   2.0f / 3; // SET DIVISION LENGTH HERE!
 
-float calculateSyncedFrequency(float potVal) {
-  freq = minFreq + potVal * (maxFreq - minFreq);
-
-  divisionLength =   2.0f / 3; // SET DIVISION LENGTH HERE!
-
-  return bpm / (60 * divisionLength);
-}
+//   return bpm / (60 * divisionLength);
+// }
 
 void loop() {
-  switch (currentLfoMode) {
-    case SIN:
-      funcVal = sin(phase);
-      break;
-    case TRI:
-      funcVal = triangle(phase);
-      break;
-    case SQUARE:
-      funcVal = square(phase);
-      break;
-    case SAW:
-      funcVal = saw(phase);
-      break;
-    case RAND:
-      if (!lfoSynced) {
-        funcVal = constrain(randomValue(funcVal), -1, 1);
-      }
-      break;
-  }
+  lfo1.update();
+  // lfo2.update();
 
-  Serial.println(funcVal);
-
-  int pwmVal = (int)(127 + 127 * funcVal);
-  analogWrite(pinOut1, pwmVal);
-
-  int ledAdjustedPWM = pow(pwmVal / 255.0, 2) * 255.0;
-  analogWrite(ledPin1, ledAdjustedPWM);
-  
-  // updateFrequency();
-  // updateOffset();
-
-  if (lfoSynced) {
-    freq = calculateSyncedFrequency(analogRead(potPin1));
-    increment = 2 * PI * freq / sampleRate; // Interpolate function value based on BPM between clock pulses
-  } else {
-    freq = calculateLfoFrequency(analogRead(potPin1));
-    increment = 2 * PI * freq / sampleRate;
-  }
-
-  phase += increment;
-
-  if (phase >= 2 * PI) {
-    phase -= 2 * PI;
-
-    if (lfoSynced && currentLfoMode == RAND) {
-      // For synced LFO get a random value and hold it for whole cycle
-      funcVal = random (0, 100001) / 100000.0;
-    }
-
-  }
-
-  // Serial.print("BPM: ");
-  // Serial.println(bpm);
-
-  // Serial.print("freq: ");
-  // Serial.println(freq);
-
-  // Serial.print("freq value:");
-  // Serial.println(freq);
-  
-
-  delay(1000 / sampleRate);
+  delay(1000 / g_sampleRate);
 }
 
 void clockISR() {
   unsigned long now = millis();
-  unsigned long interval = now - lastTime;
+  unsigned long interval = now - g_last_time;
 
   if (interval > 0) {
-    // Calculate BPM
-    lastTime = now;
-    float reading = (60000.0 / interval) / ppq;
-    bpm = reading;
-
-    // Adjust phase to clock pulses
-    if (lfoSynced && currentLfoMode != RAND) {
-      long cycleLength = divisionLength * ppq; //8 * 24 
-      float pulsePhaseLength = 2 * PI / cycleLength;
-      phase = pulsePhaseLength * clockCounter;
-
-      if (clockCounter >= cycleLength) {
-        // phase = 0;
-        clockCounter = 0;
-      }
-    }
-
-    // Increment clock counter
-    clockCounter++;
-    phaseResetCounter++;
+    g_last_time = now;
+    g_bpm = (60000.0 / interval) / g_ppq;
   }
 }
 
-void resetISR() {
-  clockCounter = 0;
-  phaseResetCounter = 0;
-  phase = 0;
+void lfo1ResetISR() {
+  lfo1.reset();
 }
 
-// updateOffset();
-
-float triangle(float phase) {
-  float normPhase = fmod(phase, 2 * PI) / (2 * PI);
-  return 2.0 * (1.0 - fabs(2.0 * normPhase - 1.0)) - 1.0;
+void lfo2ResetISR() {
+  // lfo2.reset();
 }
 
-float saw(float phase) {
-  return (phase / (2 * PI)) * 2.0 - 1.0;
-}
+// float triangle(float phase) {
+//   float normPhase = fmod(phase, 2 * PI) / (2 * PI);
+//   return 2.0 * (1.0 - fabs(2.0 * normPhase - 1.0)) - 1.0;
+// }
 
-float square(float phase) {
-  if (phase > PI) {
-    return -1;
-  } else {
-    return 1;
-  }
-}
+// float saw(float phase) {
+//   return (phase / (2 * PI)) * 2.0 - 1.0;
+// }
 
-float randomValue(float funcVal) {
-  return random (2) ? funcVal + 0.01 : funcVal - 0.01;
-}
+// float square(float phase) {
+//   if (phase > PI) {
+//     return -1;
+//   } else {
+//     return 1;
+//   }
+// }
