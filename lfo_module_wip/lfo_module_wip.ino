@@ -53,7 +53,7 @@ class LFO {
 
     WaveformFunc getLfoModeFunction() {
       // TODO - implement, based on 4-way switch;
-      return sineValue;
+      return squareValue;
     }
 
     float getOffsetCv() {
@@ -62,12 +62,15 @@ class LFO {
     }
 
     float getNoteDivision() {
-      return 2.0f / 3;
-      // TODO: implement based on rate pin
+      return 2.0f / 3; // Placeholder
+
+      // int divisionsLength = sizeof(noteDivisions) / sizeof(noteDivisions[0]);
+
+      // return noteDivisions[analogRead(this->ratePin) / (1023 / divisionsLength)];
     }
 
     float getFreeFrequency() {
-        float potVal = 10; // Todo: read
+        float potVal = 80; // Todo: read
         float normalized = potVal / 1023.0;
         float curved = pow(normalized, this->exponentialQ);
 
@@ -111,14 +114,14 @@ class LFO {
 
       // DAC
       this->writeDAC((2047 + 2047 * offset_function_val));
-
+      Serial.println((int)(2047 + 2047 * offset_function_val));
 
       // LEDs
       uint8_t pwm_value = (uint8_t)(127 + 127 * offset_function_val);
       uint8_t led_adjusted_pwm = (uint8_t)pow(pwm_value / 255.0, 2) * 255.0; // Possible upgrade: integer math?
       // analogWrite(ledPin1, led_adjusted_pwm); // TODO: WRITE LED ADJUSTED VALUE TO LFO OUTPUT
 
-      Serial.println(pwm_value);
+
     }
 
     void writeDAC(uint16_t value) {
