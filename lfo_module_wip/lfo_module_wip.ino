@@ -1,4 +1,5 @@
 #include <math.h>
+#include <SPI.h>
 
 enum LFOMode {
   mode_sine,
@@ -8,11 +9,12 @@ enum LFOMode {
 };
 
 // Global configuration
-const float g_sampleRate = 100;
-const int g_ppq = 24; // Minibrute 2S default setting
+const float SAMPLE_RATE = 100;
+const int PPQ = 24; // Minibrute 2S default setting
 
 // Global variables
-const int clockPin = 2; // Interrupt PIN for clock sync
+const int CS_PIN = 9;
+const int CLOCK_PIN = 2; // Interrupt PIN for clock sync
 volatile unsigned long g_last_time = 0;
 volatile float g_bpm = 120.0f;
 typedef float (*WaveformFunc)(float phase);
@@ -25,6 +27,7 @@ class LFO {
     int offsetPin;             // Analog input pin to control offset
     int ledPin;                // Pin for an LED indicator
     int resetPin;              // Pin for CV reset signal
+    uint8_t channel;           // DAC output channel
     float minFreq;             // Minimum frequency (Hz)
     float maxFreq;             // Maximum frequency (Hz)
     float exponentialQ;        // Curve shaping factor for exponential response
@@ -32,13 +35,13 @@ class LFO {
     int clockCounter = 0;      // Counts external clock ticks
 
     // Constructor with initializer list
-    LFO(int o, int r, int off, int l, int rst, float minF, float maxF, float q)
-      : outPin(o), ratePin(r), offsetPin(off), ledPin(l), resetPin(rst),
+    LFO(int o, int r, int off, int l, int rst, uint8_t chnl, float minF, float maxF, float q)
+      : outPin(o), ratePin(r), offsetPin(off), ledPin(l), resetPin(rst), channel(chnl),
         minFreq(minF), maxFreq(maxF),
         exponentialQ(q) {}
 
     void update() {
-      this->outputValue();
+      this->outputValues();
       this->updatePhase();
     }
 
@@ -64,7 +67,7 @@ class LFO {
     }
 
     float getFreeFrequency() {
-        float potVal = 250; // Todo: read
+        float potVal = 10; // Todo: read
         float normalized = potVal / 1023.0;
         float curved = pow(normalized, this->exponentialQ);
 
@@ -72,13 +75,13 @@ class LFO {
     }
 
     float getSyncedFrequency() {
-      return 1.0;
+      return 0.5;
       // TODO - Calcuate freq value based on ratePin reading and map to division length + BPM
     }
 
     float updatePhase() {
       float freq = this->getIsSynced() ? this->getSyncedFrequency() : this->getFreeFrequency();
-      float increment = 2 * PI * freq / g_sampleRate;
+      float increment = 2 * PI * freq / SAMPLE_RATE;
 
       this->phase += increment;
 
@@ -89,7 +92,7 @@ class LFO {
 
     void clockPulse() {
       if (this->getIsSynced()) {
-        long cycle_length = this->getNoteDivision() * g_ppq; 
+        long cycle_length = this->getNoteDivision() * PPQ; 
         float pulse_phase_length = 2 * PI / cycle_length;
         // phase = pulsePhaseLength * clockCounter;
 
@@ -102,17 +105,36 @@ class LFO {
       this->clockCounter++;
     }
 
-    void outputValue() {
+    void outputValues() {
       WaveformFunc lfo_function = this->getLfoModeFunction();
       float offset_function_val = constrain(lfo_function(this->phase) + this->getOffsetCv(), -1, 1);
 
-      uint8_t pwm_value = (uint8_t)(127 + 127 * offset_function_val);
-      // analogWrite(pinOut1, pwm_value); // TODO: WRITE VALUE TO LFO OUTPUT
+      // DAC
+      this->writeDAC((2047 + 2047 * offset_function_val));
 
+
+      // LEDs
+      uint8_t pwm_value = (uint8_t)(127 + 127 * offset_function_val);
       uint8_t led_adjusted_pwm = (uint8_t)pow(pwm_value / 255.0, 2) * 255.0; // Possible upgrade: integer math?
       // analogWrite(ledPin1, led_adjusted_pwm); // TODO: WRITE LED ADJUSTED VALUE TO LFO OUTPUT
 
       Serial.println(pwm_value);
+    }
+
+    void writeDAC(uint16_t value) {
+
+      // value must be 0–4095 (12-bit)
+      uint16_t packet = 0;
+
+      if (this->channel == 1) packet |= (1 << 15);
+
+      packet |= (2 << 13);  // Gain
+      packet |= (1 << 12);  // Output active (SHDN = 1)
+      packet |= (value & 0x0FFF); // 12-bit data in bits 11–0
+
+      digitalWrite(CS_PIN, LOW);
+      SPI.transfer16(packet);
+      digitalWrite(CS_PIN, HIGH);
     }
 
     void reset () {
@@ -164,23 +186,23 @@ int noteDivisions[] = {
 };
 
 int resetCycleLenghts[] = {
-  1 * g_ppq, // 0.125f,
-  1 * g_ppq, // 0.25f,
-  3 * g_ppq, // 0.25f * 1.5, = 0.375
+  1 * PPQ, // 0.125f,
+  1 * PPQ, // 0.25f,
+  3 * PPQ, // 0.25f * 1.5, = 0.375
   // 0.5f / 3,
-  1 * g_ppq, // 0.5f,
-  3 * g_ppq, // 0.5f * 1.5,
+  1 * PPQ, // 0.5f,
+  3 * PPQ, // 0.5f * 1.5,
   // 1.0f / 3,
-  1 * g_ppq, // 1.0f, 
-  3 * g_ppq, // 1.0f * 1.5,
+  1 * PPQ, // 1.0f, 
+  3 * PPQ, // 1.0f * 1.5,
   // 2.0f / 3,
-  3 * g_ppq, // 3.0f,
+  3 * PPQ, // 3.0f,
   // 4.0f,
   // 5.0f,
-  6 * g_ppq, // 6.0f,
-  8 * g_ppq, // 8.0f,
-  16 * g_ppq, // 16.0f,
-  32 * g_ppq,// 32.0f,
+  6 * PPQ, // 6.0f,
+  8 * PPQ, // 8.0f,
+  16 * PPQ, // 16.0f,
+  32 * PPQ,// 32.0f,
 };
 
 // INIT LFOS GLOBALLY
@@ -190,17 +212,25 @@ LFO lfo1(
   A1,       // offsetPin: offset control from analog pin A1
   13,       // ledPin: onboard LED for blinking with LFO
   3,        // resetPin: pin for reset interrupt
+  0,        // DAC channel
   0.02f,     // minFreq: minimum frequency 0.02 Hz
   10.0f,    // maxFreq: maximum frequency 10 Hz
   2.0f     // exponentialQ: neutral curve shaping (1.0 = linear)
 );
 
 void setup() {
-  pinMode(clockPin, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(clockPin), clockISR, RISING);
+  pinMode(CLOCK_PIN, INPUT_PULLUP);
 
+  pinMode(CS_PIN, OUTPUT);
+  digitalWrite(CS_PIN, HIGH);
+
+  attachInterrupt(digitalPinToInterrupt(CLOCK_PIN), clockISR, RISING);
   attachInterrupt(digitalPinToInterrupt(lfo1.resetPin), lfo1ResetISR, RISING);
   // attachInterrupt(digitalPinToInterrupt(lfo2.resetPin), lfo2ResetISR, RISING);
+
+  SPI.begin();
+  SPI.beginTransaction(SPISettings(20000000, MSBFIRST, SPI_MODE0));
+
 
   Serial.begin(9600);
 }
@@ -217,7 +247,7 @@ void loop() {
   lfo1.update();
   // lfo2.update();
 
-  delay(1000 / g_sampleRate);
+  delay(1000 / SAMPLE_RATE);
 }
 
 void clockISR() {
@@ -226,7 +256,7 @@ void clockISR() {
 
   if (interval > 0) {
     g_last_time = now;
-    g_bpm = (60000.0 / interval) / g_ppq;
+    g_bpm = (60000.0 / interval) / PPQ;
   }
 }
 
